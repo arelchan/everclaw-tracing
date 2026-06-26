@@ -1,0 +1,16 @@
+{
+  "name": "tracing-viewer",
+  "version": "0.1.0",
+  "description": "Shared trace viewer (web dashboard + terminal) for openclaw / hermes / everclaw audit logs.",
+  "type": "commonjs",
+  "engines": { "node": ">=18" },
+  "bin": {
+    "tracing-ui": "server.js",
+    "tracing-view": "trace-viewer.js"
+  },
+  "scripts": {
+    "ui": "node server.js",
+    "view": "node trace-viewer.js",
+    "check": "node --check state-dir.js && node --check log-store.js && node --check server.js && node --check trace-viewer.js && node --check ui/app.js"
+  }
+}
