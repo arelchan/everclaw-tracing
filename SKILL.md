@@ -58,10 +58,38 @@ Tell the user to restart it (e.g. quit the TUI and `uv run everclaw tui` again).
    boot = [json.loads(l) for l in log.read_text().splitlines() if l.strip() and '"tracing.bootstrap"' in l]
    probes = boot[-1]["attributes"]["plugin.probes"] if boot else {}
    ok = sum(1 for v in probes.values() if v)
-   print(f"probes bound: {ok}/16", "OK" if ok >= 15 else "(some disabled — version drift, see Troubleshooting)")
+   disabled = [k for k, v in probes.items() if not v]
+   print(f"probes bound: {ok}/{len(probes)}" if probes
+         else "no bootstrap span yet — run any everclaw command, then re-check")
+   if disabled: print("DISABLED (version drift):", disabled, "-> self-heal in Step 4b")
    PY
    ```
-   Expect `probes bound: 16/16`.
+   Expect `probes bound: 16/16`. If any probe is **DISABLED**, run **Step 4b** to re-align it.
+
+### Step 4b — Self-heal if any probe is DISABLED (version drift)
+This plugin monkeypatches everclaw internals, so a probe disables itself (never crashes) when
+this user's everclaw renamed or reshaped a method it wraps. **You are Claude Code — repair it
+in place** rather than shipping degraded traces. For each `<Class>.<method>` from Step 4's
+DISABLED list:
+1. Find its probe in `package/everclaw-tracing/everclaw_tracing/instrument.py`: search
+   `_wrap(<Class>, "<method>"` (or `_wrap_sync`). Note its `expect_params=[...]` and what the
+   wrapper reads off the call args.
+2. Inspect this everclaw's ACTUAL signature (the disabled log line names the module; or grep
+   everclaw for `class <Class>`):
+   `"<target-python>" -c "import inspect; from <module> import <Class>; print(inspect.signature(<Class>.<method>))"`
+3. Reconcile — wrappers bind **positionally**, so a renamed positional arg only trips the *guard*:
+   - guard names a param that no longer exists → set `expect_params` to a param that IS still
+     present (prefer a stable one, e.g. `session_key`); the positional arg's name is irrelevant.
+   - the wrapper reads a moved attribute (e.g. `msg.content` → `req.text`) → read the new one
+     with a fallback: `getattr(x, "text", None) or getattr(x, "content", None)`.
+   - the method was renamed/removed → grep everclaw for the method now playing that role and
+     repoint the `_wrap` target.
+4. Reinstall (Step 2) + restart everclaw (Step 3) + re-run Step 4. Repeat until `16/16` — or, if a
+   choke point genuinely no longer exists in this everclaw, report which span is unavailable
+   instead of forcing it.
+> Worked example already in this code: the `AgentLoop._process_message` probe was re-aligned after
+> everclaw renamed its first arg `msg` → `req: TurnRequest` (guard relaxed to `["session_key"]`,
+> input read as `.text` with a `.content` fallback). Same move applies to any other drift.
 
 ### Step 5 — View the traces
 Run any everclaw turn (tui / agent / gateway), then launch the bundled viewer:
@@ -88,13 +116,14 @@ Note: the viewer reads on page load and does NOT auto-poll — refresh the brows
 4. **Version-drift** — it monkeypatches everclaw internals (verified against everclaw 0.1.0,
    branch `refactor/EverClaw`). If a future refactor changes a patched method's signature, that one
    probe self-disables with a warning (agent unaffected, others keep working). The `tracing.bootstrap`
-   span's `plugin.probes` map shows which are live.
+   span's `plugin.probes` map shows which are live, and **Step 4b self-heals a disabled probe** in place.
 
 ## Troubleshooting
 - **No spans / not listed in `everclaw plugins`** → wrong env (Step 1), or pruned by `uv sync` (caveat 3).
 - **Only a small `llm.call` (the SkillForge rewriter) shows, no main model call** → the plugin predates
   the streaming-capture fix, or the running process wasn't restarted (Step 3). Reinstall + restart.
-- **`probes bound: N/16` with N<16** → version drift (caveat 4); bound probes still trace.
+- **`probes bound: N/16` with N<16** → version drift; run **Step 4b** to re-align the disabled
+  probe(s) against this everclaw (bound ones keep tracing meanwhile).
 - **Viewer panel empty / stale** → refresh the browser (no auto-poll); confirm a turn actually ran.
 
 ## How it works (for the curious)
