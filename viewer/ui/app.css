@@ -2128,3 +2128,5 @@ body.app-view-api .api-only {
 .trace-jump-btn:active {
   transform: translateY(0);
 }
+
+/* memory node input/output cards render as .structured-pre (shared with llm/tool cards) */

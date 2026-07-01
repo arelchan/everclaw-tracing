@@ -1,7 +1,7 @@
 {
   "name": "tracing-viewer",
   "version": "0.1.0",
-  "description": "Shared trace viewer (web dashboard + terminal) for openclaw / hermes / everclaw audit logs.",
+  "description": "Shared trace viewer (web dashboard + terminal) for openclaw / hermes / raven audit logs.",
   "type": "commonjs",
   "engines": { "node": ">=18" },
   "bin": {

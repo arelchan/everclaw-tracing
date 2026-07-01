@@ -8,6 +8,7 @@ const { URL } = require('url');
 const { applyStateDirArg } = require('./state-dir');
 applyStateDirArg();
 const { readJsonl, getLogsDir } = require('./log-store');
+const everosDeposits = require('./everos-deposits');
 
 const PORT = Number(process.env.TRACE_UI_PORT || process.env.TRACING_UI_PORT || 4318);
 const STATE_DIR =
@@ -259,8 +260,8 @@ function detectSpanFailure(span, attrs) {
 
   if (span?.name === 'subagent.call') {
     // Only genuine-failure statuses are failures. openclaw used 'accepted' for
-    // a successful spawn; everclaw uses 'ok' / 'completed' / 'ended'. Flagging
-    // anything != 'accepted' wrongly marked successful everclaw subagents red —
+    // a successful spawn; raven uses 'ok' / 'completed' / 'ended'. Flagging
+    // anything != 'accepted' wrongly marked successful raven subagents red —
     // the span's own status.code (checked above) is authoritative.
     const subagentStatus = String(attrs['subagent.status'] || '').toLowerCase();
     if (subagentStatus === 'error' || subagentStatus === 'failed') {
@@ -270,9 +271,9 @@ function detectSpanFailure(span, attrs) {
 
   if (span?.name === 'skill.read') {
     // openclaw's skill.read signals success via skill.read.* byte/sha attrs;
-    // everclaw's read_file→skill.read signals it via skill.result_preview /
+    // raven's read_file→skill.read signals it via skill.result_preview /
     // skill.path / tool.output.artifact_bytes. Accept EITHER family as evidence
-    // of a real read so a successful everclaw read (status.code already OK above)
+    // of a real read so a successful raven read (status.code already OK above)
     // isn't false-flagged "read failed" just because the openclaw attrs are absent.
     const bytes = attrs['skill.read.file_bytes'];
     const sha1 = attrs['skill.read.file_sha1'];
@@ -338,7 +339,12 @@ function buildSpanSubtitle(name, attrs) {
     return [attrs['memory.scope'], attrs['memory.hits'] != null ? `${attrs['memory.hits']} hits` : null]
       .filter(Boolean).join(' / ');
   }
-  if (name === 'memory.store') return attrs['memory.message_count'] != null ? `${attrs['memory.message_count']} msgs` : '';
+  if (name === 'memory.store') {
+    const base = attrs['memory.message_count'] != null ? `${attrs['memory.message_count']} msgs` : '';
+    if (attrs['memory.deposit_summary']) return base ? `${base} → ${attrs['memory.deposit_summary']}` : attrs['memory.deposit_summary'];
+    if (attrs['memory.deposit_status'] === 'pending') return base ? `${base} · not yet distilled` : 'not yet distilled';
+    return base;
+  }
   if (name === 'memory.extract') return attrs['memory.surface'] || '';
   if (name === 'memory.consolidate') return attrs['memory.message_count'] != null ? `${attrs['memory.message_count']} msgs` : '';
   if (name === 'memory.profile_refresh') return attrs['memory.sections_rewritten'] != null ? `${attrs['memory.sections_rewritten']} sections` : '';
@@ -519,7 +525,7 @@ function buildTraceGroups(sessionSpans) {
   }
 
   // session.turn roots the main trace; subagent.run roots a subagent's OWN
-  // trace (everclaw subagents run as a separate trace, linked via the dispatch
+  // trace (raven subagents run as a separate trace, linked via the dispatch
   // node's subagent.trace_id). Both are first-class trace roots.
   let rootCandidates = spans.filter((span) => (span.name === 'session.turn' || span.name === 'subagent.run') && (!span.parentSpanId || !spanById.has(span.parentSpanId)));
   if (!rootCandidates.length) {
@@ -638,11 +644,59 @@ function buildTraceGroups(sessionSpans) {
   });
 }
 
+// Enrich memory.store spans with the everos deposit family (episode/fact/foresight/…)
+// distilled from that turn's memcell. Joined per-trace by (session_id, timestamp).
+// Read fresh each call so the view always reflects the latest async distillation.
+function enrichStoreDeposits(spans) {
+  const storeSpans = spans.filter((span) => span.name === 'memory.store');
+  if (!storeSpans.length) return;
+  let index;
+  try {
+    index = everosDeposits.buildDepositIndex(everosDeposits.resolveEverosRoot('raven'));
+  } catch {
+    return;
+  }
+  if (!index || !index.size) return;
+  for (const span of storeSpans) {
+    const attrs = span.attributes || {};
+    const sessionId = attrs['memory.session_id'] || span.sessionKey || span.sessionId;
+    const deposit = everosDeposits.resolveDeposit(index, sessionId, parseTime(span.startTime));
+    if (!deposit) {
+      attrs['memory.deposit_status'] = 'pending';
+      span.attributes = attrs;
+      span.displaySubtitle = buildSpanSubtitle(span.name, attrs);
+      continue;
+    }
+    const payload = {
+      parentId: deposit.parentId,
+      timestamp: deposit.timestamp,
+      deltaMs: deposit.deltaMs,
+      counts: deposit.counts,
+      families: {}
+    };
+    for (const [type, entries] of Object.entries(deposit.types)) {
+      payload.families[type] = entries.map((entry) => ({
+        id: entry.id,
+        subject: entry.subject,
+        text: entry.text,
+        startTime: entry.startTime,
+        endTime: entry.endTime
+      }));
+    }
+    attrs['memory.deposit_status'] = 'distilled';
+    attrs['memory.deposit_summary'] = everosDeposits.summarize(deposit);
+    attrs['memory.deposit_json'] = JSON.stringify(payload);
+    span.attributes = attrs;
+    span.displaySubtitle = buildSpanSubtitle(span.name, attrs);
+  }
+}
+
 function buildSessions() {
   const rawSpans = dedupeSpans(readJsonl('spans')).map(normalizeSpan);
   const identityIndex = buildSessionIdentityIndex(rawSpans);
   const projectedSpans = rawSpans.map((span) => projectSpanForDisplay(span, identityIndex)).filter(Boolean);
   const spans = synthesizeSubagentCallSpans(projectedSpans, identityIndex);
+  enrichStoreDeposits(spans);
   const events = readJsonl('events');
   const spansBySessionId = new Map();
   for (const span of spans) {

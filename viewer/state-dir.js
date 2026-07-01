@@ -11,8 +11,8 @@ function frameworkStateDir(name) {
       return process.env.OPENCLAW_STATE_DIR || path.join(home, '.openclaw');
     case 'hermes':
       return process.env.HERMES_HOME || path.join(home, '.hermes');
-    case 'everclaw':
-      return path.join(home, '.everclaw', 'traces');
+    case 'raven':
+      return path.join(home, '.raven', 'traces');
     default:
       return null;
   }

@@ -1085,11 +1085,11 @@ function renderSubagentCallCard(span, artifacts) {
   const task = attrs['subagent.task'] || attrs['subagent.label'] || '';
   const dispatchInput = task || '';
   const dispatchOutput = toolOutput?.result ?? toolOutput?.output ?? null;
-  // everclaw persists the subagent's final return ON the span itself — the
+  // raven persists the subagent's final return ON the span itself — the
   // `Subagent Result` artifact ({task, result}) plus the `subagent.result_preview`
   // attribute — NOT as a separate child session (the openclaw model just below).
   // Without this, the card only checked the child-session / spawn-tool paths,
-  // found nothing for everclaw, and fell back to "还没有拿到子 agent 的最终返回"
+  // found nothing for raven, and fell back to "还没有拿到子 agent 的最终返回"
   // even though the result was right there.
   const subagentResult = artifactByLabel(artifacts, 'Subagent Result')?.parsed;
   const resultText = subagentResult?.result ?? attrs['subagent.result_preview'] ?? null;
@@ -1103,7 +1103,7 @@ function renderSubagentCallCard(span, artifacts) {
     ? 'child session final output'
     : (resultText ? 'subagent result artifact' : 'spawn accepted payload');
 
-  // Forward link: everclaw runs the subagent as its OWN trace; this dispatch
+  // Forward link: raven runs the subagent as its OWN trace; this dispatch
   // node only summarizes it. Offer a jump into that trace's full tree.
   const subTraceId = attrs['subagent.trace_id'] || null;
   const jumpCard = subTraceId
@@ -1784,10 +1784,10 @@ function renderSkillReadCard(trace, span, artifacts) {
   const skillReadArtifact = artifactByLabel(artifacts, 'Skill Read');
   const readContent = artifactByLabel(artifacts, 'Read Content');
   const readRequest = artifactByLabel(artifacts, 'Read Request');
-  // everclaw's read_file→skill.read carries content/params on the re-typed tool
+  // raven's read_file→skill.read carries content/params on the re-typed tool
   // span's own Tool Input/Output artifacts (+ skill.result_preview), not the
   // openclaw Skill Read / Read Content / Read Request artifacts. Fall back to
-  // everclaw's so the card isn't empty.
+  // raven's so the card isn't empty.
   const toolInput = artifactByLabel(artifacts, 'Tool Input');
   const toolOutput = artifactByLabel(artifacts, 'Tool Output');
   const readInputValue = {
@@ -1946,17 +1946,19 @@ function renderContent(span, trace, artifacts) {
     hiddenArtifactLabels.add('Skill Read');
     hiddenArtifactLabels.add('Read Request');
     hiddenArtifactLabels.add('Read Content');
-    // everclaw's read_file→skill.read is a re-typed tool call: its Tool
+    // raven's read_file→skill.read is a re-typed tool call: its Tool
     // Input/Output ARE the skill's input/output, now consumed by
     // renderSkillReadCard. Hide them so they don't double-render as
     // separate Tool cards alongside the Skill cards.
     hiddenArtifactLabels.add('Tool Input');
     hiddenArtifactLabels.add('Tool Output');
   }
+  if (span.name === 'memory.recall') hiddenArtifactLabels.add('Memory Recall');
+  if (span.name === 'memory.store') hiddenArtifactLabels.add('Memory Store');
   const artifactEntries = artifacts.filter((entry) => !hiddenArtifactLabels.has(entry.label));
   const artifactCards = span.name === 'session.turn'
     ? ''
-    : (span.name === 'llm.call' || span.name === 'tool.call' || span.name === 'subagent.call' || span.name === 'skill.read') && !artifactEntries.length
+    : (span.name === 'llm.call' || span.name === 'tool.call' || span.name === 'subagent.call' || span.name === 'skill.read' || span.name === 'memory.recall' || span.name === 'memory.store' || span.name === 'memory.feedback') && !artifactEntries.length
     ? ''
     : artifactEntries.length
     ? artifactEntries
@@ -2013,9 +2015,140 @@ function renderContent(span, trace, artifacts) {
       ${renderSubagentRunCard(span)}
       ${renderSkillReadCard(trace, span, artifacts)}
       ${renderSkillEvidenceCard(trace, span)}
+      ${renderMemoryCard(span, artifacts)}
       ${artifactCards}
     </div>
   `;
+}
+
+// Memory nodes as Input → Output, mirroring the llm/tool cards. Under the everos
+// backend only recall/store/feedback fire; each is a request step with a real
+// input and output. store's output is the async-distilled deposit family.
+function renderMemoryCard(span, artifacts) {
+  if (span.name === 'memory.recall') return renderMemoryRecallCard(span, artifacts);
+  if (span.name === 'memory.store') return renderMemoryStoreCard(span, artifacts);
+  if (span.name === 'memory.feedback') return renderMemoryFeedbackCard(span);
+  return '';
+}
+
+function memoryIoCard(title, note, bodyHtml) {
+  return `
+    <article class="content-card wide-card">
+      <header><h4>${escapeHtml(title)}</h4>${note ? `<span class="card-note">${escapeHtml(note)}</span>` : ''}</header>
+      ${bodyHtml}
+    </article>`;
+}
+
+// All memory bodies render as a single structured-pre text block — identical
+// styling/wrapping/alignment to the llm/tool cards (no bespoke list/flex markup).
+function preBody(text) {
+  const t = text == null ? '' : String(text);
+  return `<pre class="structured-pre">${escapeHtml(t.length ? t : '(empty)')}</pre>`;
+}
+
+function renderMemoryRecallCard(span, artifacts) {
+  const attrs = span.attributes || {};
+  const query = attrs['memory.query'] || '';
+  const inNote = [
+    attrs['memory.scope'] ? `scope=${attrs['memory.scope']}` : null,
+    attrs['memory.user_id'] ? `user=${attrs['memory.user_id']}` : null,
+    attrs['memory.top_k'] != null ? `top_k=${attrs['memory.top_k']}` : null
+  ]
+    .filter(Boolean)
+    .join(' · ');
+  const recalled = artifactByLabel(artifacts, 'Memory Recall')?.parsed;
+  const list = Array.isArray(recalled) ? recalled : [];
+  const hits = attrs['memory.hits'];
+  let outText;
+  if (list.length) {
+    outText = list
+      .map((m, i) => {
+        const score = m && m.score != null ? ` (score ${Number(m.score).toFixed(4)})` : '';
+        return `${i + 1}.${score}\n${(m && m.text) || ''}`;
+      })
+      .join('\n\n');
+  } else {
+    outText = hits === 0 ? 'No memories recalled (0 hits).' : 'No recalled-memory artifact captured.';
+  }
+  return (
+    memoryIoCard('Recall · Input', inNote, preBody(query || '(empty query)')) +
+    memoryIoCard('Recall · Output', hits != null ? `${hits} hit${hits === 1 ? '' : 's'}` : '', preBody(outText))
+  );
+}
+
+function renderMemoryStoreCard(span, artifacts) {
+  const attrs = span.attributes || {};
+  const stored = artifactByLabel(artifacts, 'Memory Store')?.parsed;
+  const messages = stored && Array.isArray(stored.messages) ? stored.messages : [];
+  const inText = messages.length
+    ? messages.map((m) => `[${(m && m.role) || '?'}]\n${(m && m.content) || ''}`).join('\n\n')
+    : 'No stored-messages artifact captured.';
+  const inNote = [
+    attrs['memory.message_count'] != null ? `${attrs['memory.message_count']} msgs` : null,
+    attrs['memory.session_id'] || null
+  ]
+    .filter(Boolean)
+    .join(' · ');
+
+  const status = attrs['memory.deposit_status'];
+  let outText;
+  let outNote = attrs['memory.deposit_summary'] || '';
+  if (status === 'pending') {
+    outNote = 'async · ~30s';
+    outText =
+      "Not yet distilled — messages ingested as a raw memcell; everos's async cascade (~30s) hasn't produced episode/fact/foresight yet. Refresh later.";
+  } else if (status === 'distilled') {
+    let payload = {};
+    try {
+      payload = JSON.parse(attrs['memory.deposit_json'] || '{}');
+    } catch {
+      payload = {};
+    }
+    const families = payload.families || {};
+    const TYPE_LABEL = {
+      episode: 'episodes',
+      atomic_fact: 'atomic facts',
+      foresight: 'foresights',
+      agent_case: 'agent cases',
+      agent_skill: 'agent skills'
+    };
+    const ORDER = ['episode', 'atomic_fact', 'foresight', 'agent_case', 'agent_skill'];
+    const blocks = ORDER.filter((type) => families[type] && families[type].length)
+      .map((type) => {
+        const lines = families[type]
+          .map((entry, i) => {
+            const win = entry.startTime && entry.endTime ? `  [${entry.startTime} → ${entry.endTime}]` : '';
+            const subj = entry.subject ? `${entry.subject}\n     ` : '';
+            return `  ${i + 1}. ${subj}${entry.text || ''}${win}`;
+          })
+          .join('\n');
+        return `${TYPE_LABEL[type] || type} (${families[type].length})\n${lines}`;
+      })
+      .join('\n\n');
+    const mc = payload.parentId ? ` · memcell ${payload.parentId}` : '';
+    const delta = payload.deltaMs == null ? '?' : payload.deltaMs;
+    const header = `everos distilled this from the turn's memcell${mc}\njoined by (session_id, timestamp), Δ≈${delta}ms. Profile (user.md) is a merged everos doc — async, not per-turn.`;
+    outText = `${header}\n\n${blocks || 'Ingested, but nothing was distilled from this turn.'}`;
+  } else {
+    outText = 'Deposit not resolved (everos data unavailable to the viewer).';
+  }
+  return memoryIoCard('Store · Input', inNote, preBody(inText)) + memoryIoCard('Store · Output', outNote, preBody(outText));
+}
+
+function renderMemoryFeedbackCard(span) {
+  const attrs = span.attributes || {};
+  const norm = (v) => {
+    if (typeof v === 'string') {
+      const parsed = parseJsonMaybe(v);
+      if (parsed !== undefined && parsed !== null) v = parsed;
+    }
+    if (v == null) return '(none)';
+    if (Array.isArray(v)) return v.length ? v.join(', ') : '(none)';
+    return String(v);
+  };
+  const inText = `injected skills: ${norm(attrs['memory.injected'])}\nused skills: ${norm(attrs['memory.used'])}`;
+  const outText = 'No output — backend.feedback is a deliberate no-op in everos 1.0: the skill-usage signal is captured but not consumed.';
+  return memoryIoCard('Feedback · Input', '', preBody(inText)) + memoryIoCard('Feedback · Output', 'everos no-op', preBody(outText));
 }
 
 function renderRaw(span, artifacts) {
